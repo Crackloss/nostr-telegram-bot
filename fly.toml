@@ -1,0 +1,20 @@
+app = 'bot-telegram-nostr'
+primary_region = 'cdg'
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/data/nostr_directory.db"
+
+[mounts]
+  source = "bot_data"
+  destination = "/data"
+
+[processes]
+  app = "python bot.py"
+
+[[vm]]
+  memory = 256
+  cpus = 1
+  auto_stop = false
