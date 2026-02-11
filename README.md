@@ -227,4 +227,4 @@ Open source. Parte del proyecto [nostrfacil.com](https://nostrfacil.com).
 
 ---
 
-**¿Dudas?** Encuéntrame en Nostr → [primal.net/crackloss](https://primal.net/p/nprofile1qqszj8995px29k0t0c06y5cx3wzwqvks0dejpxhnu90sqa708m9lxfs4gnym0)
+**¿Dudas?** Encuéntrame en Nostr → [primal.net/voidhash](https://primal.net/p/nprofile1qqszj8995px29k0t0c06y5cx3wzwqvks0dejpxhnu90sqa708m9lxfs4gnym0)
