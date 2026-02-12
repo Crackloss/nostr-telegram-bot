@@ -10,6 +10,9 @@ import re
 import json
 import logging
 import sqlite3
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,10 +28,14 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
-# ─── Configuración ───────────────────────────────────────
+# ─── Configuración ───────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))  # ID del grupo
+ALLOWED_THREAD_ID = int(os.environ.get("ALLOWED_THREAD_ID", "0"))  # ID del hilo/tema del foro
 GITHUB_PUSH_ENABLED = os.environ.get("GITHUB_PUSH_ENABLED", "false").lower() == "true"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "Crackloss/nostrweb")
+GITHUB_JSON_PATH = os.environ.get("GITHUB_JSON_PATH", "data/directorio.json")
 DB_PATH = os.environ.get("DB_PATH", "data/nostr_directory.db")
 MAX_MSG_LENGTH = 4000  # Margen bajo el límite de 4096 de Telegram
 NJUMP_BASE = "https://njump.me/"
@@ -43,7 +50,7 @@ log = logging.getLogger(__name__)
 NPUB_REGEX = re.compile(r"\b(npub1[a-z0-9]{58})\b", re.IGNORECASE)
 
 
-# ─── Base de datos ───────────────────────────────────────
+# ─── Base de datos ───────────────────────────────────────────────
 def init_db():
     """Crea las tablas si no existen."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -92,7 +99,7 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-# ─── Helper: nombre a mostrar ────────────────────────────
+# ─── Helper: nombre a mostrar ────────────────────────────────────
 def get_display_name(profile: dict) -> str:
     """Devuelve el nombre a mostrar: custom_name > telegram_username > telegram_name > Anónimo."""
     if profile.get("custom_name"):
@@ -102,7 +109,14 @@ def get_display_name(profile: dict) -> str:
     return profile.get("telegram_name") or "Anónimo"
 
 
-# ─── Funciones de datos ─────────────────────────────────
+def get_display_name_clean(profile: dict) -> str:
+    """Devuelve el nombre limpio (sin @) para el JSON de la web."""
+    if profile.get("custom_name"):
+        return profile["custom_name"]
+    return profile.get("telegram_username") or profile.get("telegram_name") or "Anónimo"
+
+
+# ─── Funciones de datos ─────────────────────────────────────────
 def add_profile(npub: str, user_id: int, username: str | None, name: str) -> bool:
     """Añade un perfil. Devuelve True si es nuevo, False si ya existía."""
     conn = get_db()
@@ -136,19 +150,6 @@ def set_web_consent(user_id: int, consent: bool) -> bool:
     cursor = conn.execute(
         "UPDATE profiles SET web_consent = ? WHERE telegram_user_id = ?",
         (1 if consent else 0, user_id),
-    )
-    conn.commit()
-    updated = cursor.rowcount > 0
-    conn.close()
-    return updated
-
-
-def set_custom_name(user_id: int, custom_name: str | None) -> bool:
-    """Establece un nombre personalizado para un usuario."""
-    conn = get_db()
-    cursor = conn.execute(
-        "UPDATE profiles SET custom_name = ? WHERE telegram_user_id = ?",
-        (custom_name, user_id),
     )
     conn.commit()
     updated = cursor.rowcount > 0
@@ -202,17 +203,6 @@ def get_profile_by_user(user_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def get_profile_by_npub(npub: str) -> dict | None:
-    """Devuelve el perfil buscando por npub."""
-    conn = get_db()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM profiles WHERE npub = ?", (npub,)
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
 def get_profile_count() -> int:
     """Devuelve el número total de perfiles."""
     conn = get_db()
@@ -221,11 +211,10 @@ def get_profile_count() -> int:
     return count
 
 
-# ─── Gestión de mensajes pineados ────────────────────────
+# ─── Gestión de mensajes pineados ────────────────────────────────
 def save_pinned_message(chat_id: int, message_id: int, profile_count: int):
     """Guarda referencia a un mensaje pineado."""
     conn = get_db()
-    # Marcar todos los anteriores como no actuales
     conn.execute(
         "UPDATE pinned_messages SET is_current = 0 WHERE chat_id = ?",
         (chat_id,),
@@ -263,7 +252,7 @@ def get_all_pinned(chat_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# ─── Formateo del mensaje pineado ────────────────────────
+# ─── Formateo del mensaje pineado ────────────────────────────────
 def format_profile_line(idx: int, profile: dict) -> str:
     """Formatea una línea del directorio."""
     display = get_display_name(profile)
@@ -291,21 +280,17 @@ def build_directory_messages(profiles: list[dict], chat_id: int) -> list[str]:
     messages = []
     current_lines = []
     current_length = len(header)
-    start_idx = 1
 
     for i, profile in enumerate(profiles, 1):
         line = format_profile_line(i, profile)
-        line_length = len(line) + 1  # +1 por el \n
+        line_length = len(line) + 1
 
         footer = footer_template.format(count=len(profiles), date=date_str)
         chain_note = "\n\n⬇️ <i>Continúa en el siguiente mensaje...</i>"
 
-        # Verificar si cabe en el mensaje actual
         if current_length + line_length + len(footer) + len(chain_note) > MAX_MSG_LENGTH:
-            # Cerrar mensaje actual con nota de continuación
             msg = header + "\n".join(current_lines) + chain_note
             messages.append(msg)
-            # Reiniciar
             current_lines = []
             current_length = len(header)
             header = "🟣 <b>Directorio Nostr (continuación)</b>\n\n"
@@ -313,7 +298,6 @@ def build_directory_messages(profiles: list[dict], chat_id: int) -> list[str]:
         current_lines.append(line)
         current_length += line_length
 
-    # Último mensaje
     footer = footer_template.format(count=len(profiles), date=date_str)
     msg = header + "\n".join(current_lines) + footer
     messages.append(msg)
@@ -329,7 +313,6 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
     current_pinned = get_current_pinned(chat_id)
 
     if len(messages_text) == 1 and current_pinned:
-        # Caso simple: editar el mensaje existente
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -345,10 +328,9 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 return
             log.warning("No se pudo editar mensaje pineado: %s. Creando nuevo.", e)
 
-    # Si hay múltiples mensajes o no hay pineado, crear nuevos
     if current_pinned and len(messages_text) > 1:
         try:
-            old_msg = await context.bot.edit_message_text(
+            await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=current_pinned["message_id"],
                 text=messages_text[0],
@@ -358,20 +340,20 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         except BadRequest:
             pass
 
-    # Enviar mensajes nuevos (o el único si no había pineado)
     last_msg = None
+    thread_kwargs = {"message_thread_id": ALLOWED_THREAD_ID} if ALLOWED_THREAD_ID else {}
     for i, text in enumerate(messages_text):
         if i == 0 and current_pinned:
-            continue  # Ya editamos el primero
+            continue
         sent = await context.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            **thread_kwargs,
         )
         last_msg = sent
 
-    # Pinear el último mensaje
     if last_msg:
         try:
             await context.bot.pin_chat_message(
@@ -384,12 +366,13 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         except BadRequest as e:
             log.error("No se pudo pinear: %s", e)
     elif not current_pinned:
-        # Primera vez: enviar y pinear
+        thread_kwargs = {"message_thread_id": ALLOWED_THREAD_ID} if ALLOWED_THREAD_ID else {}
         sent = await context.bot.send_message(
             chat_id=chat_id,
             text=messages_text[0],
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            **thread_kwargs,
         )
         try:
             await context.bot.pin_chat_message(
@@ -403,7 +386,7 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             log.error("No se pudo pinear: %s", e)
 
 
-# ─── Exportación JSON para la web ────────────────────────
+# ─── Exportación JSON para la web ────────────────────────────────
 def export_web_json() -> str:
     """Genera el JSON para nostrfacil.com/directorio."""
     profiles = get_web_profiles()
@@ -413,7 +396,7 @@ def export_web_json() -> str:
         "profiles": [
             {
                 "npub": p["npub"],
-                "display_name": get_display_name(p),
+                "display_name": get_display_name_clean(p),
                 "njump_url": f"{NJUMP_BASE}{p['npub']}",
                 "added_at": p["added_at"],
             }
@@ -424,14 +407,65 @@ def export_web_json() -> str:
 
 
 def save_web_json():
-    """Guarda el JSON en disco (para push a GitHub o servir directamente)."""
+    """Guarda el JSON en disco y lo sube a GitHub si está habilitado."""
+    json_content = export_web_json()
+
+    # Guardar localmente
     path = Path("data/directorio.json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(export_web_json(), encoding="utf-8")
+    path.write_text(json_content, encoding="utf-8")
     log.info("JSON web exportado a %s", path)
 
+    # Push a GitHub
+    if GITHUB_PUSH_ENABLED and GITHUB_TOKEN:
+        try:
+            push_to_github(json_content)
+        except Exception as e:
+            log.error("Error al subir JSON a GitHub: %s", e)
 
-# ─── Handlers de Telegram ────────────────────────────────
+
+def push_to_github(content: str):
+    """Sube el JSON al repo de GitHub vía API."""
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_JSON_PATH}"
+
+    # Obtener el SHA del archivo actual (si existe) para poder actualizarlo
+    sha = None
+    req = urllib.request.Request(api_url, method="GET")
+    req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    req.add_header("Accept", "application/vnd.github.v3+json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            sha = data.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+
+    # Preparar el contenido en base64
+    content_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+
+    payload = {
+        "message": f"Actualizar directorio Nostr ({datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC)",
+        "content": content_b64,
+        "branch": "main",
+    }
+    if sha:
+        payload["sha"] = sha
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(api_url, data=body, method="PUT")
+    req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    req.add_header("Accept", "application/vnd.github.v3+json")
+    req.add_header("Content-Type", "application/json")
+
+    with urllib.request.urlopen(req) as resp:
+        if resp.status in (200, 201):
+            log.info("JSON subido a GitHub exitosamente")
+        else:
+            log.warning("GitHub respondió con status %s", resp.status)
+
+
+# ─── Handlers de Telegram ────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detecta npubs en mensajes del grupo."""
     if not update.message or not update.message.text:
@@ -441,6 +475,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
         return
 
+    # Filtrar por hilo específico del foro
+    thread_id = getattr(update.message, "message_thread_id", None)
+    if ALLOWED_THREAD_ID and thread_id != ALLOWED_THREAD_ID:
+        return
+
     text = update.message.text
     user = update.message.from_user
     matches = NPUB_REGEX.findall(text)
@@ -448,7 +487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not matches:
         return
 
-    npub = matches[0].lower()  # Solo el primero por mensaje
+    npub = matches[0].lower()
     user_name = user.first_name or ""
     if user.last_name:
         user_name += f" {user.last_name}"
@@ -458,7 +497,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if existing:
         if existing["npub"] == npub:
             await update.message.reply_text(
-                f"✅ Ya estás en el directorio con ese npub.",
+                "✅ Ya estás en el directorio con ese npub.",
                 reply_to_message_id=update.message.message_id,
             )
             return
@@ -472,7 +511,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
             await update.message.reply_text(
-                f"🔄 Tu npub ha sido actualizado en el directorio.",
+                "🔄 Tu npub ha sido actualizado en el directorio.",
                 reply_to_message_id=update.message.message_id,
             )
             await update_pinned_directory(context, chat_id)
@@ -524,10 +563,9 @@ async def handle_consent_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     parts = data.split("_")
-    action = parts[1]  # "yes" o "no"
+    action = parts[1]
     target_user_id = int(parts[2])
 
-    # Solo el propio usuario puede responder
     if query.from_user.id != target_user_id:
         await query.answer("⚠️ Solo el dueño del perfil puede responder.", show_alert=True)
         return
@@ -554,7 +592,7 @@ async def handle_consent_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
 
-# ─── Comandos ─────────────────────────────────────────────
+# ─── Comandos ─────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start."""
     await update.message.reply_text(
@@ -697,31 +735,30 @@ async def cmd_renombrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_profiles = get_all_profiles()
 
     if search_term.startswith("@"):
-        # Buscar por username
         username = search_term[1:].lower()
         for p in all_profiles:
-            if p.get("telegram_username", "").lower() == username:
+            if (p.get("telegram_username") or "").lower() == username:
                 profile = p
                 break
     else:
-        # Buscar por npub parcial
         for p in all_profiles:
             if p["npub"].startswith(search_term.lower()):
                 profile = p
                 break
 
     if not profile:
-        await update.message.reply_text(f"❌ No se encontró ningún perfil con: <code>{search_term}</code>",
-                                         parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"❌ No se encontró ningún perfil con: <code>{search_term}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    # Resetear o establecer nombre
     if new_name == "--reset":
         set_custom_name_by_npub(profile["npub"], None)
-        display = profile.get("telegram_username") or profile.get("telegram_name") or "Anónimo"
+        original = profile.get("telegram_username") or profile.get("telegram_name") or "Anónimo"
         await update.message.reply_text(
             f"✅ Nombre personalizado eliminado.\n"
-            f"Ahora muestra: <b>{display}</b>",
+            f"Ahora muestra: <b>{original}</b>",
             parse_mode=ParseMode.HTML,
         )
     else:
@@ -733,7 +770,6 @@ async def cmd_renombrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-    # Actualizar directorio y JSON
     await update_pinned_directory(context, chat_id)
     save_web_json()
 
@@ -743,7 +779,6 @@ async def cmd_directorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user = update.message.from_user
 
-    # Verificar que es admin
     try:
         member = await context.bot.get_chat_member(chat_id, user.id)
         if member.status not in ("administrator", "creator"):
@@ -753,10 +788,11 @@ async def cmd_directorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await update_pinned_directory(context, chat_id)
-    await update.message.reply_text("✅ Directorio actualizado y pineado.")
+    save_web_json()
+    await update.message.reply_text("✅ Directorio actualizado, pineado y subido a la web.")
 
 
-# ─── Main ─────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────
 def main():
     init_db()
 
