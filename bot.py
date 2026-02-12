@@ -10,9 +10,6 @@ import re
 import json
 import logging
 import sqlite3
-import base64
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,14 +25,10 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
-# ─── Configuración ───────────────────────────────────────────────
+# ─── Configuración ───────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))  # ID del grupo
-ALLOWED_THREAD_ID = int(os.environ.get("ALLOWED_THREAD_ID", "0"))  # ID del hilo/tema del foro
 GITHUB_PUSH_ENABLED = os.environ.get("GITHUB_PUSH_ENABLED", "false").lower() == "true"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "Crackloss/nostrweb")
-GITHUB_JSON_PATH = os.environ.get("GITHUB_JSON_PATH", "data/directorio.json")
 DB_PATH = os.environ.get("DB_PATH", "data/nostr_directory.db")
 MAX_MSG_LENGTH = 4000  # Margen bajo el límite de 4096 de Telegram
 NJUMP_BASE = "https://njump.me/"
@@ -50,7 +43,7 @@ log = logging.getLogger(__name__)
 NPUB_REGEX = re.compile(r"\b(npub1[a-z0-9]{58})\b", re.IGNORECASE)
 
 
-# ─── Base de datos ───────────────────────────────────────────────
+# ─── Base de datos ───────────────────────────────────────
 def init_db():
     """Crea las tablas si no existen."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +74,14 @@ def init_db():
             value TEXT
         )
     """)
+
+    # ─── Migración: añadir custom_name si no existe ───
+    cursor = conn.execute("PRAGMA table_info(profiles)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "custom_name" not in columns:
+        conn.execute("ALTER TABLE profiles ADD COLUMN custom_name TEXT DEFAULT NULL")
+        log.info("Columna custom_name añadida a profiles")
+
     conn.commit()
     conn.close()
     log.info("Base de datos inicializada en %s", DB_PATH)
@@ -91,7 +92,17 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-# ─── Funciones de datos ─────────────────────────────────────────
+# ─── Helper: nombre a mostrar ────────────────────────────
+def get_display_name(profile: dict) -> str:
+    """Devuelve el nombre a mostrar: custom_name > telegram_username > telegram_name > Anónimo."""
+    if profile.get("custom_name"):
+        return profile["custom_name"]
+    if profile.get("telegram_username"):
+        return f"@{profile['telegram_username']}"
+    return profile.get("telegram_name") or "Anónimo"
+
+
+# ─── Funciones de datos ─────────────────────────────────
 def add_profile(npub: str, user_id: int, username: str | None, name: str) -> bool:
     """Añade un perfil. Devuelve True si es nuevo, False si ya existía."""
     conn = get_db()
@@ -132,6 +143,32 @@ def set_web_consent(user_id: int, consent: bool) -> bool:
     return updated
 
 
+def set_custom_name(user_id: int, custom_name: str | None) -> bool:
+    """Establece un nombre personalizado para un usuario."""
+    conn = get_db()
+    cursor = conn.execute(
+        "UPDATE profiles SET custom_name = ? WHERE telegram_user_id = ?",
+        (custom_name, user_id),
+    )
+    conn.commit()
+    updated = cursor.rowcount > 0
+    conn.close()
+    return updated
+
+
+def set_custom_name_by_npub(npub: str, custom_name: str | None) -> bool:
+    """Establece un nombre personalizado buscando por npub."""
+    conn = get_db()
+    cursor = conn.execute(
+        "UPDATE profiles SET custom_name = ? WHERE npub = ?",
+        (custom_name, npub),
+    )
+    conn.commit()
+    updated = cursor.rowcount > 0
+    conn.close()
+    return updated
+
+
 def get_all_profiles() -> list[dict]:
     """Devuelve todos los perfiles ordenados por fecha."""
     conn = get_db()
@@ -165,6 +202,17 @@ def get_profile_by_user(user_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def get_profile_by_npub(npub: str) -> dict | None:
+    """Devuelve el perfil buscando por npub."""
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM profiles WHERE npub = ?", (npub,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def get_profile_count() -> int:
     """Devuelve el número total de perfiles."""
     conn = get_db()
@@ -173,7 +221,7 @@ def get_profile_count() -> int:
     return count
 
 
-# ─── Gestión de mensajes pineados ────────────────────────────────
+# ─── Gestión de mensajes pineados ────────────────────────
 def save_pinned_message(chat_id: int, message_id: int, profile_count: int):
     """Guarda referencia a un mensaje pineado."""
     conn = get_db()
@@ -215,14 +263,10 @@ def get_all_pinned(chat_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# ─── Formateo del mensaje pineado ────────────────────────────────
+# ─── Formateo del mensaje pineado ────────────────────────
 def format_profile_line(idx: int, profile: dict) -> str:
     """Formatea una línea del directorio."""
-    name = profile["telegram_username"]
-    if name:
-        display = f"@{name}"
-    else:
-        display = profile["telegram_name"] or "Anónimo"
+    display = get_display_name(profile)
     npub_short = profile["npub"][:16] + "..."
     return f"{idx}. {display} → <a href='{NJUMP_BASE}{profile['npub']}'>{npub_short}</a>"
 
@@ -302,14 +346,12 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             log.warning("No se pudo editar mensaje pineado: %s. Creando nuevo.", e)
 
     # Si hay múltiples mensajes o no hay pineado, crear nuevos
-    # Primero, si el actual está lleno, congelarlo con enlace
     if current_pinned and len(messages_text) > 1:
         try:
-            # Añadir enlace al primer mensaje del nuevo bloque
             old_msg = await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=current_pinned["message_id"],
-                text=messages_text[0],  # El primer bloque (ya tiene nota de continuación)
+                text=messages_text[0],
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -318,7 +360,6 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
 
     # Enviar mensajes nuevos (o el único si no había pineado)
     last_msg = None
-    thread_kwargs = {"message_thread_id": ALLOWED_THREAD_ID} if ALLOWED_THREAD_ID else {}
     for i, text in enumerate(messages_text):
         if i == 0 and current_pinned:
             continue  # Ya editamos el primero
@@ -327,11 +368,10 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            **thread_kwargs,
         )
         last_msg = sent
 
-    # Pinear el último mensaje (el más reciente, siempre visible)
+    # Pinear el último mensaje
     if last_msg:
         try:
             await context.bot.pin_chat_message(
@@ -345,13 +385,11 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             log.error("No se pudo pinear: %s", e)
     elif not current_pinned:
         # Primera vez: enviar y pinear
-        thread_kwargs = {"message_thread_id": ALLOWED_THREAD_ID} if ALLOWED_THREAD_ID else {}
         sent = await context.bot.send_message(
             chat_id=chat_id,
             text=messages_text[0],
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            **thread_kwargs,
         )
         try:
             await context.bot.pin_chat_message(
@@ -365,7 +403,7 @@ async def update_pinned_directory(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             log.error("No se pudo pinear: %s", e)
 
 
-# ─── Exportación JSON para la web ────────────────────────────────
+# ─── Exportación JSON para la web ────────────────────────
 def export_web_json() -> str:
     """Genera el JSON para nostrfacil.com/directorio."""
     profiles = get_web_profiles()
@@ -375,7 +413,7 @@ def export_web_json() -> str:
         "profiles": [
             {
                 "npub": p["npub"],
-                "display_name": p["telegram_username"] or p["telegram_name"] or "Anónimo",
+                "display_name": get_display_name(p),
                 "njump_url": f"{NJUMP_BASE}{p['npub']}",
                 "added_at": p["added_at"],
             }
@@ -386,66 +424,14 @@ def export_web_json() -> str:
 
 
 def save_web_json():
-    """Guarda el JSON en disco y lo sube a GitHub si está habilitado."""
-    json_content = export_web_json()
-
-    # Guardar localmente
+    """Guarda el JSON en disco (para push a GitHub o servir directamente)."""
     path = Path("data/directorio.json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json_content, encoding="utf-8")
+    path.write_text(export_web_json(), encoding="utf-8")
     log.info("JSON web exportado a %s", path)
 
-    # Push a GitHub
-    if GITHUB_PUSH_ENABLED and GITHUB_TOKEN:
-        try:
-            push_to_github(json_content)
-        except Exception as e:
-            log.error("Error al subir JSON a GitHub: %s", e)
 
-
-def push_to_github(content: str):
-    """Sube el JSON al repo de GitHub vía API."""
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_JSON_PATH}"
-
-    # Primero, obtener el SHA del archivo actual (si existe) para poder actualizarlo
-    sha = None
-    req = urllib.request.Request(api_url, method="GET")
-    req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
-    req.add_header("Accept", "application/vnd.github.v3+json")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            sha = data.get("sha")
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-        # 404 = archivo no existe todavía, lo crearemos
-
-    # Preparar el contenido en base64
-    content_b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-
-    payload = {
-        "message": f"Actualizar directorio Nostr ({datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC)",
-        "content": content_b64,
-        "branch": "main",
-    }
-    if sha:
-        payload["sha"] = sha
-
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(api_url, data=body, method="PUT")
-    req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
-    req.add_header("Accept", "application/vnd.github.v3+json")
-    req.add_header("Content-Type", "application/json")
-
-    with urllib.request.urlopen(req) as resp:
-        if resp.status in (200, 201):
-            log.info("JSON subido a GitHub exitosamente")
-        else:
-            log.warning("GitHub respondió con status %s", resp.status)
-
-
-# ─── Handlers de Telegram ────────────────────────────────────────
+# ─── Handlers de Telegram ────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detecta npubs en mensajes del grupo."""
     if not update.message or not update.message.text:
@@ -453,11 +439,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.message.chat_id
     if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
-        return
-
-    # Filtrar por hilo específico del foro
-    thread_id = getattr(update.message, "message_thread_id", None)
-    if ALLOWED_THREAD_ID and thread_id != ALLOWED_THREAD_ID:
         return
 
     text = update.message.text
@@ -482,7 +463,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         else:
-            # Actualizar npub
+            # Actualizar npub (conservar custom_name)
             conn = get_db()
             conn.execute(
                 "UPDATE profiles SET npub = ? WHERE telegram_user_id = ?",
@@ -573,7 +554,7 @@ async def handle_consent_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
 
-# ─── Comandos ─────────────────────────────────────────────────────
+# ─── Comandos ─────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start."""
     await update.message.reply_text(
@@ -603,9 +584,15 @@ async def cmd_miperfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    display = get_display_name(profile)
+    custom_note = ""
+    if profile.get("custom_name"):
+        custom_note = f"\n✏️ Nombre personalizado: <b>{profile['custom_name']}</b>"
+
     web_status = "✅ Sí" if profile["web_consent"] else "❌ No"
     await update.message.reply_text(
         f"🟣 <b>Tu perfil</b>\n\n"
+        f"<b>Nombre:</b> {display}{custom_note}\n"
         f"<b>npub:</b> <code>{profile['npub']}</code>\n"
         f"🔗 <a href='{NJUMP_BASE}{profile['npub']}'>Ver en Nostr</a>\n"
         f"📅 Registrado: {profile['added_at'][:10]}\n"
@@ -672,6 +659,85 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_renombrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando admin: /renombrar <npub_parcial_o_@username> <nuevo_nombre>
+    Ejemplo: /renombrar npub19yw2t Satoshi Nakamoto
+    Ejemplo: /renombrar @crackloss Satoshi Nakamoto
+    Para quitar nombre custom: /renombrar npub19yw2t --reset
+    """
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+
+    # Verificar que es admin
+    try:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await update.message.reply_text("⚠️ Solo los administradores pueden usar este comando.")
+            return
+    except BadRequest:
+        pass
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Uso: <code>/renombrar &lt;npub_parcial o @username&gt; &lt;nuevo_nombre&gt;</code>\n"
+            "Para resetear: <code>/renombrar &lt;npub_parcial&gt; --reset</code>\n\n"
+            "Ejemplo: <code>/renombrar npub19yw Satoshi</code>\n"
+            "Ejemplo: <code>/renombrar @crackloss Satoshi</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    search_term = args[0]
+    new_name = " ".join(args[1:])
+
+    # Buscar el perfil
+    profile = None
+    all_profiles = get_all_profiles()
+
+    if search_term.startswith("@"):
+        # Buscar por username
+        username = search_term[1:].lower()
+        for p in all_profiles:
+            if p.get("telegram_username", "").lower() == username:
+                profile = p
+                break
+    else:
+        # Buscar por npub parcial
+        for p in all_profiles:
+            if p["npub"].startswith(search_term.lower()):
+                profile = p
+                break
+
+    if not profile:
+        await update.message.reply_text(f"❌ No se encontró ningún perfil con: <code>{search_term}</code>",
+                                         parse_mode=ParseMode.HTML)
+        return
+
+    # Resetear o establecer nombre
+    if new_name == "--reset":
+        set_custom_name_by_npub(profile["npub"], None)
+        display = profile.get("telegram_username") or profile.get("telegram_name") or "Anónimo"
+        await update.message.reply_text(
+            f"✅ Nombre personalizado eliminado.\n"
+            f"Ahora muestra: <b>{display}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        set_custom_name_by_npub(profile["npub"], new_name)
+        await update.message.reply_text(
+            f"✅ Nombre actualizado:\n"
+            f"<b>{new_name}</b>\n"
+            f"npub: <code>{profile['npub'][:20]}...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # Actualizar directorio y JSON
+    await update_pinned_directory(context, chat_id)
+    save_web_json()
+
+
 async def cmd_directorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fuerza la actualización del mensaje pineado (solo admins)."""
     chat_id = update.message.chat_id
@@ -690,7 +756,7 @@ async def cmd_directorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Directorio actualizado y pineado.")
 
 
-# ─── Main ─────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────
 def main():
     init_db()
 
@@ -704,6 +770,7 @@ def main():
     app.add_handler(CommandHandler("websi", cmd_websi))
     app.add_handler(CommandHandler("webno", cmd_webno))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("renombrar", cmd_renombrar))
     app.add_handler(CommandHandler("directorio", cmd_directorio))
 
     # Callbacks de botones inline
